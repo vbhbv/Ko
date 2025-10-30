@@ -1,3 +1,2 @@
+pyrogram
 python-telegram-bot
-openai
-requests
