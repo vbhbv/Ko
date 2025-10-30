@@ -1,141 +1,149 @@
-import pyrogram
+# indexer.py
 import sqlite3
+import requests
+from bs4 import BeautifulSoup
+import openai
+import json
 import time
-import asyncio
-from config import API_ID, API_HASH, SOURCE_CHANNEL, OPENAI_API_KEY # استيراد المفاتيح
+import random
+import logging
 
-# إعداد قاعدة البيانات
+# تهيئة التسجيل
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
+
+try:
+    from config import OPENAI_API_KEY
+except ImportError:
+    logger.error("خطأ: لم يتم العثور على config.py")
+    exit()
+
+# تهيئة AI
+openai.api_key = OPENAI_API_KEY
 DB_NAME = "books_index.db"
-conn = sqlite3.connect(DB_NAME)
-cursor = conn.cursor()
-
-# إنشاء جدول الفهرس إذا لم يكن موجوداً
-cursor.execute("""
-    CREATE TABLE IF NOT EXISTS books (
-        id INTEGER PRIMARY KEY,
-        message_id INTEGER UNIQUE,
-        title TEXT,
-        author TEXT,
-        file_id TEXT,
-        publish_date TEXT
-    )
-""")
-conn.commit()
-
-# تهيئة عميل Pyrogram
-app = pyrogram.Client(
-    "indexer_session", 
-    api_id=API_ID, 
-    api_hash=API_HASH
-)
 
 # ===================================================
-# دالة التحليل الذكي باستخدام الذكاء الاصطناعي (AI Parsing)
-# *هذه الدالة تستخدم مفتاح OpenAI الخاص بك لتحليل النص المعقد*
+# 1. إعداد قاعدة البيانات
 # ===================================================
-def intelligent_parse(raw_text):
-    """
-    يستخدم الذكاء الاصطناعي (GPT) لاستخلاص العنوان والمؤلف بدقة عالية 
-    من نص الرسالة غير المنظم. 
-    """
-    import openai 
-    openai.api_key = OPENAI_API_KEY
+def setup_db():
+    conn = sqlite3.connect(DB_NAME)
+    cursor = conn.cursor()
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS books (
+            id INTEGER PRIMARY KEY,
+            title TEXT UNIQUE,
+            author TEXT,
+            source_url TEXT,
+            download_link TEXT,
+            summary TEXT
+        )
+    """)
+    conn.commit()
+    return conn
 
+# ===================================================
+# 2. دالة جلب البيانات باستخدام الـ AI للتنظيف
+# ===================================================
+def clean_data_with_ai(raw_title, raw_summary):
+    """يستخدم الـ AI لتنظيف وتحسين البيانات الوصفية للكتاب."""
     prompt = f"""
-    أنت محلل بيانات ذكي. حلل النص التالي واستخرج منه بدقة:
-    1. العنوان الكامل للكتاب (title).
-    2. اسم المؤلف (author).
+    قم بتنظيف وتحليل البيانات التالية:
+    1. استخرج العنوان الدقيق والمؤلف من '{raw_title}'.
+    2. لخص '{raw_summary}' في جملتين فقط.
     
-    الرد يجب أن يكون بصيغة JSON فقط. إذا لم تجد العنوان، استخدم "عنوان غير معروف".
-    
-    النص: "{raw_text[:1000]}"
-    """ # يتم اقتطاع النص الطويل لحماية الـ API Limit
-    
+    رد بصيغة JSON فقط: {{'title': '...', 'author': '...', 'summary': '...'}}
+    """
     try:
         response = openai.chat.completions.create(
             model="gpt-3.5-turbo",
             messages=[
-                {"role": "system", "content": "You are a data extraction expert. Extract the book title and author as a JSON object: {'title': '...', 'author': '...'}. Reply ONLY with the JSON."},
+                {"role": "system", "content": "You are a data cleaning and summarization expert. Respond ONLY with the requested JSON object."},
                 {"role": "user", "content": prompt}
             ],
             response_format={"type": "json_object"},
-            max_tokens=150
+            max_tokens=250
         )
-        
-        # تحليل استجابة الذكاء الاصطناعي
-        import json
-        ai_data = json.loads(response.choices[0].message.content)
-        return ai_data
-
+        return json.loads(response.choices[0].message.content)
     except Exception as e:
-        print(f"⚠️ خطأ في تحليل AI: {e}")
-        return {"title": "عنوان غير معروف", "author": "مؤلف غير معروف"}
+        logger.error(f"خطأ في تنظيف البيانات باستخدام AI: {e}")
+        return None
 
-
-# ========== دالة الفهرسة الرئيسية ==========
-async def start_indexing():
-    await app.start()
-    print("✅ تم الاتصال بحسابك. بدء عملية فهرسة قناة @lovekotob...")
-
-    last_message_id = 0
-    total_indexed = 0
-
-    while True:
+# ===================================================
+# 3. دالة جلب البيانات من موقع معين (مثال: مكتبة النور)
+# *ملاحظة: تحتاج إلى تخصيص هذا الكود لكل موقع*
+# ===================================================
+def scrape_noorbook(conn):
+    base_url = "https://www.noor-book.com/ar/books"
+    logger.info(f"بدء جلب البيانات من: {base_url}")
+    
+    # سنفهرس أول 5 صفحات كمثال (لأن الفهرسة الكاملة مع AI تستغرق وقتاً وتكلفة)
+    for page in range(1, 6): 
         try:
-            # جلب الرسائل على دفعات (دفعة بحد أقصى 100 رسالة)
-            messages = await app.get_history(
-                SOURCE_CHANNEL, 
-                limit=100, 
-                offset_id=last_message_id
-            )
-        except Exception as e:
-            print(f"❌ خطأ في جلب سجل الرسائل: {e}")
-            break
+            response = requests.get(f"{base_url}?page={page}", timeout=10)
+            soup = BeautifulSoup(response.content, 'html.parser')
+            
+            # العثور على كل كارت كتاب
+            book_cards = soup.find_all('div', class_='book-card') 
 
-        if not messages:
-            break
-
-        for message in messages:
-            # نتأكد من أن الرسالة ملف (كتاب) ولها نص
-            if message.document and (message.caption or message.text):
-                
-                raw_text = message.caption or message.text
-                
-                # استخدام التحليل الذكي (AI) لاستخلاص البيانات
-                extracted_data = intelligent_parse(raw_text)
-                
-                extracted_title = extracted_data.get("title", "عنوان غير معروف")
-                extracted_author = extracted_data.get("author", "مؤلف غير معروف")
-                
-                if extracted_title != "عنوان غير معروف":
-                    try:
+            for card in book_cards:
+                try:
+                    # استخراج رابط صفحة الكتاب
+                    book_link = card.find('a', class_='book-cover')['href']
+                    full_link = f"https://www.noor-book.com{book_link}"
+                    
+                    # استخراج العنوان الأولي (قد يكون غير نظيف)
+                    raw_title = card.find('h4', class_='book-title').text.strip()
+                    
+                    # **[هنا تحتاج إلى زيارة كل صفحة جُزئياً لجلب رابط التنزيل والملخص]**
+                    
+                    # *لغرض التوضيح، سنفترض أننا حصلنا على البيانات*
+                    raw_summary = "ملخص مؤقت لغرض الاختبار."
+                    download_link = "http://example.com/download/book.pdf" 
+                    
+                    # استخدام AI لتنظيف البيانات
+                    ai_data = clean_data_with_ai(raw_title, raw_summary)
+                    
+                    if ai_data:
+                        cursor = conn.cursor()
                         cursor.execute("""
                             INSERT OR IGNORE INTO books 
-                            (message_id, title, author, file_id, publish_date)
+                            (title, author, source_url, download_link, summary)
                             VALUES (?, ?, ?, ?, ?)
                         """, (
-                            message.id,
-                            extracted_title,
-                            extracted_author,
-                            message.document.file_id, 
-                            str(message.date)
+                            ai_data['title'],
+                            ai_data['author'],
+                            full_link,
+                            download_link,
+                            ai_data['summary']
                         ))
-                        total_indexed += 1
-                    except Exception as e:
-                        print(f"⚠️ خطأ في حفظ الرسالة {message.id} في DB: {e}")
+                        conn.commit()
+                        logger.info(f"✅ تم فهرسة: {ai_data['title']}")
+                    
+                    # انتظار لمنع الحظر
+                    time.sleep(random.uniform(2, 5)) 
+
+                except Exception as e:
+                    logger.error(f"خطأ في معالجة كارت كتاب: {e}")
+                    continue
             
-            last_message_id = message.id # تحديث لآخر رسالة تمت معالجتها
+            logger.info(f"انتهت الصفحة رقم: {page}")
+        
+        except Exception as e:
+            logger.error(f"خطأ في جلب الصفحة {page}: {e}")
+            break
 
-        conn.commit()
-        print(f"تم فهرسة دفعة جديدة. إجمالي الكتب المفهرسة: {total_indexed}. آخر معرّف رسالة: {last_message_id}")
-        # انتظار قصير لتجنب قيود تليجرام
-        time.sleep(1.5) 
-
-    print("🎉 اكتملت عملية فهرسة القناة بالكامل!")
-    await app.stop()
-    conn.close()
-
-# تشغيل الدالة
-if __name__ == "__main__":
-    asyncio.run(start_indexing())
+# ===================================================
+# 4. دالة التشغيل الرئيسية
+# ===================================================
+def main_indexer():
+    conn = setup_db()
     
+    # تنفيذ الفهرسة لكل موقع
+    scrape_noorbook(conn) 
+    # يمكنك إضافة دوال لـ "scrape_kotobati" و "scrape_alkutub" هنا.
+
+    conn.close()
+    logger.info("🎉 اكتملت عملية الفهرسة من جميع المصادر!")
+
+if __name__ == "__main__":
+    main_indexer()
